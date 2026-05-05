@@ -3,3 +3,7 @@ dist/
 *.log
 .env
 .DS_Store
+
+# Plugin runtime ships with its built UI — Claude Code can't run npm install on plugin install.
+!plugins/canopy/ui/dist/
+!plugins/canopy/ui/dist/**

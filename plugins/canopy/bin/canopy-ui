@@ -1,0 +1,220 @@
+#!/usr/bin/env node
+// canopy-ui — ephemeral local web server that serves the workspace
+// configuration UI on a random port. Exits when the user clicks Save & Close.
+
+import { createServer } from 'node:http'
+import { readFile, writeFile, readdir, stat } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { join, dirname, extname, resolve, normalize } from 'node:path'
+import { homedir } from 'node:os'
+import { spawn } from 'node:child_process'
+
+const WORKSPACES_ROOT = join(homedir(), '.claude', 'canopy', 'workspaces')
+const PLUGIN_ROOT = resolve(import.meta.dirname, '..')
+const UI_DIST = join(PLUGIN_ROOT, 'ui', 'dist')
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000
+
+const args = process.argv.slice(2)
+const wsIdx = args.indexOf('--workspace')
+if (wsIdx === -1 || !args[wsIdx + 1]) {
+  console.error('Usage: canopy-ui --workspace <name> [--no-open]')
+  process.exit(2)
+}
+const name = args[wsIdx + 1]
+const noOpen = args.includes('--no-open')
+const workspaceConfigPath = join(WORKSPACES_ROOT, name, 'workspace.json')
+if (!existsSync(workspaceConfigPath)) {
+  console.error(`Workspace not found: ${name}\nLooked at: ${workspaceConfigPath}`)
+  process.exit(1)
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2'
+}
+
+let lastActivity = Date.now()
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on('data', c => chunks.push(c))
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')))
+    req.on('error', reject)
+  })
+}
+
+function serveStatic(filePath, res) {
+  if (!existsSync(filePath)) return false
+  return stat(filePath).then(st => {
+    if (!st.isFile()) return false
+    const type = MIME[extname(filePath)] || 'application/octet-stream'
+    return readFile(filePath).then(data => {
+      res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' })
+      res.end(data)
+      return true
+    })
+  }).catch(() => false)
+}
+
+const server = createServer(async (req, res) => {
+  lastActivity = Date.now()
+  const url = new URL(req.url, `http://${req.headers.host}`)
+  const route = `${req.method} ${url.pathname}`
+
+  try {
+    if (route === 'GET /api/workspace') {
+      const data = await readFile(workspaceConfigPath, 'utf-8')
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(data)
+      return
+    }
+
+    if (route === 'POST /api/workspace') {
+      const body = await readBody(req)
+      const profile = JSON.parse(body)
+      if (profile.name !== name) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'name mismatch' }))
+        return
+      }
+      await writeFile(workspaceConfigPath, JSON.stringify(profile, null, 2) + '\n', 'utf-8')
+      res.writeHead(204)
+      res.end()
+      return
+    }
+
+    if (route === 'GET /api/suggested-roots') {
+      const home = homedir()
+      const candidates = [
+        ['Home', home],
+        ['Documents', join(home, 'Documents')],
+        ['Development', join(home, 'Development')],
+        ['Projects', join(home, 'Projects')],
+        ['code', join(home, 'code')],
+        ['src', join(home, 'src')],
+        ['Desktop', join(home, 'Desktop')]
+      ]
+      const out = []
+      for (const [label, path] of candidates) {
+        if (existsSync(path)) out.push({ label, path })
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ home, roots: out }))
+      return
+    }
+
+    if (route === 'GET /api/browse') {
+      const target = url.searchParams.get('path') || homedir()
+      const absTarget = resolve(target)
+      let st
+      try { st = await stat(absTarget) } catch (e) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'path does not exist', path: absTarget }))
+        return
+      }
+      if (!st.isDirectory()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'not a directory', path: absTarget }))
+        return
+      }
+      const entries = await readdir(absTarget, { withFileTypes: true }).catch(() => [])
+      const items = []
+      for (const e of entries) {
+        if (!e.isDirectory()) continue
+        if (e.name.startsWith('.') && !['.claude'].includes(e.name)) continue  // hide dotfiles except .claude
+        const full = join(absTarget, e.name)
+        items.push({
+          name: e.name,
+          path: full,
+          hasGit: existsSync(join(full, '.git')),
+          hasClaude: existsSync(join(full, '.claude')),
+          hasPackageJson: existsSync(join(full, 'package.json'))
+        })
+      }
+      items.sort((a, b) => {
+        const aRepo = a.hasGit || a.hasClaude
+        const bRepo = b.hasGit || b.hasClaude
+        if (aRepo !== bRepo) return aRepo ? -1 : 1
+        return a.name.localeCompare(b.name)
+      })
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({
+        path: absTarget,
+        parent: dirname(absTarget) === absTarget ? null : dirname(absTarget),
+        items
+      }))
+      return
+    }
+
+    if (route === 'POST /api/done') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true }))
+      setTimeout(() => process.exit(0), 50)
+      return
+    }
+
+    if (route === 'GET /api/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, lastActivity }))
+      return
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405); res.end(); return
+    }
+
+    // Serve static files from ui/dist/. Block path traversal.
+    const safePath = normalize(url.pathname).replace(/^\/+/, '')
+    if (safePath.includes('..')) { res.writeHead(403); res.end(); return }
+    let target = join(UI_DIST, safePath || 'index.html')
+    if (await serveStatic(target, res)) return
+    // SPA fallback
+    if (await serveStatic(join(UI_DIST, 'index.html'), res)) return
+    res.writeHead(404, { 'Content-Type': 'text/plain' })
+    res.end('not found')
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'text/plain' })
+    res.end(`server error: ${err.message}`)
+  }
+})
+
+server.listen(0, '127.0.0.1', () => {
+  const port = server.address().port
+  const url = `http://127.0.0.1:${port}/`
+  // Print URL FIRST so the user can recover from a failed `open`.
+  console.log(`Editing workspace "${name}"`)
+  console.log(`Open in browser: ${url}`)
+  console.log('(Save & Close in the UI to apply changes and exit.)')
+  if (!noOpen) {
+    const opener = process.platform === 'darwin' ? 'open'
+      : process.platform === 'win32' ? 'cmd'
+      : 'xdg-open'
+    const openerArgs = process.platform === 'win32' ? ['/c', 'start', '', url] : [url]
+    const child = spawn(opener, openerArgs, { stdio: 'ignore', detached: true })
+    child.on('error', () => console.log('(browser launch failed; visit the URL above manually)'))
+    child.unref()
+  }
+})
+
+setInterval(() => {
+  if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
+    console.log(`No activity for ${IDLE_TIMEOUT_MS / 60000} min — exiting.`)
+    process.exit(0)
+  }
+}, 30 * 1000).unref()
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    console.log(`\n${sig} received — exiting without saving.`)
+    process.exit(130)
+  })
+}

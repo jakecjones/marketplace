@@ -1,0 +1,16 @@
+{
+  "name": "jakecjones-marketplace",
+  "owner": { "name": "Jake Jones" },
+  "plugins": [
+    {
+      "name": "canopy",
+      "source": "./plugins/canopy",
+      "description": "Multi-repo workspace orchestration: merge .claude/ configs from declared repos and host project-specific docs."
+    },
+    {
+      "name": "ux-harness",
+      "source": "./plugins/ux-harness",
+      "description": "UI/UX interaction harness — renders components, captures input, streams responses."
+    }
+  ]
+}

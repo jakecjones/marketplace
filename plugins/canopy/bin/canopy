@@ -1,0 +1,661 @@
+#!/usr/bin/env node
+// canopy — multi-repo workspace orchestration CLI for Claude Code
+// Single-file, zero npm deps, Node 20+. Invoked from inside Claude sessions
+// via ${CLAUDE_PLUGIN_ROOT}/bin/canopy.
+
+import { readFile, writeFile, readdir, mkdir, rm, rename as fsRename, stat, unlink } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { join, dirname, resolve, basename } from 'node:path'
+import { homedir } from 'node:os'
+import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+
+const WORKSPACES_ROOT = join(homedir(), '.claude', 'canopy', 'workspaces')
+
+// Hashes of legacy command files seeded by the Electron app. If a workspace
+// has these untouched, scrub them on next launch (R7+B2 from the plan).
+const LEGACY_COMMAND_HASHES = new Set([
+  // canopy-canopy default-commands.ts initial save-context content
+  // (precomputed offline; if mismatch, leave the file in place — user customized)
+  // Add the actual sha256 hex digests once known. Using empty set is safe:
+  // unknown legacy files are left alone, only matches are removed.
+])
+
+// ── helpers ───────────────────────────────────────────────────────────────
+
+async function readJson(path) {
+  const raw = await readFile(path, 'utf-8')
+  return JSON.parse(raw)
+}
+
+async function writeJson(path, data) {
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, JSON.stringify(data, null, 2) + '\n', 'utf-8')
+}
+
+async function writeText(path, content) {
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, content, 'utf-8')
+}
+
+function workspaceDir(name) {
+  return join(WORKSPACES_ROOT, name)
+}
+
+function workspaceConfigPath(name) {
+  return join(workspaceDir(name), 'workspace.json')
+}
+
+async function loadProfile(name) {
+  const path = workspaceConfigPath(name)
+  if (!existsSync(path)) {
+    throw new Error(`Workspace not found: ${name}\nLooked at: ${path}`)
+  }
+  return readJson(path)
+}
+
+async function saveProfile(name, profile) {
+  await writeJson(workspaceConfigPath(name), profile)
+}
+
+function aliasFor(repo) {
+  return repo.alias || basename(repo.path) || repo.path
+}
+
+// Default position for a new graph node. 4-column grid with 240×100 spacing.
+function defaultNodePosition(existingCount) {
+  return {
+    x: (existingCount % 4) * 240 + 40,
+    y: Math.floor(existingCount / 4) * 100 + 40
+  }
+}
+
+// Build a graph node for a repo. Used when adding a repo via CLI or
+// when reconciling a profile whose repos[] is ahead of graph.nodes[].
+function buildNode(repo, position) {
+  return {
+    id: globalThis.crypto.randomUUID(),
+    repoPath: repo.path,
+    alias: aliasFor(repo),
+    description: '',
+    x: position.x,
+    y: position.y
+  }
+}
+
+// Auto-wire: every existing node gets a directed edge to the new node, with
+// an empty label. Empty labels render as a hover hint ("add label") in the
+// UI, so the user is invited to refine — but the graph is fully connected
+// from the start, which is the whole point of "easier to update than config".
+function autowireEdges(existingNodes, newNodeId) {
+  return existingNodes.map(n => ({
+    id: globalThis.crypto.randomUUID(),
+    sourceId: n.id,
+    targetId: newNodeId,
+    label: ''
+  }))
+}
+
+// If profile.repos has entries that aren't in profile.graph.nodes, add nodes
+// for them and auto-wire to existing nodes. Mutates profile in place. Used
+// at launch time to heal workspaces created or grown via the CLI.
+function reconcileGraph(profile) {
+  profile.graph ||= { nodes: [], edges: [], viewportX: 0, viewportY: 0 }
+  let added = 0
+  for (const repo of profile.repos || []) {
+    if (profile.graph.nodes.some(n => n.repoPath === repo.path)) continue
+    const node = buildNode(repo, defaultNodePosition(profile.graph.nodes.length))
+    const newEdges = autowireEdges(profile.graph.nodes, node.id)
+    profile.graph.nodes.push(node)
+    profile.graph.edges.push(...newEdges)
+    added++
+  }
+  return added
+}
+
+async function listWorkspaces() {
+  if (!existsSync(WORKSPACES_ROOT)) return []
+  const entries = await readdir(WORKSPACES_ROOT, { withFileTypes: true })
+  const out = []
+  for (const e of entries) {
+    if (!e.isDirectory()) continue
+    try {
+      const profile = await readJson(join(WORKSPACES_ROOT, e.name, 'workspace.json'))
+      out.push(profile)
+    } catch {
+      // skip dirs without a valid workspace.json
+    }
+  }
+  return out
+}
+
+// ── merge logic (ported from ipc-handlers.ts:421-541) ─────────────────────
+
+async function mergeWorkspaceConfig(name) {
+  const profile = await loadProfile(name)
+  // Heal profiles whose repos[] grew without the graph being updated (CLI
+  // add-repo from earlier versions, hand-edited workspace.json, etc.). This
+  // also persists so the next UI open shows the auto-wired graph.
+  const reconciled = reconcileGraph(profile)
+  if (reconciled > 0) await saveProfile(name, profile)
+  const repos = profile.repos || []
+  const graph = profile.graph || { nodes: [], edges: [] }
+  const dir = workspaceDir(name)
+
+  const repoMapLines = [`# Workspace: ${name}`, '', '## Repository Map', '']
+  const allAllow = []
+  const allDeny = []
+  const mergedMcpServers = {}
+  const repoInstructions = []
+
+  for (const repo of repos) {
+    const repoBase = join(repo.path, '.claude')
+    const alias = aliasFor(repo)
+    repoMapLines.push(`- **${alias}**: \`${repo.path}\``)
+
+    try {
+      const instructions = await readFile(join(repoBase, 'CLAUDE.md'), 'utf-8')
+      if (instructions.trim()) {
+        repoInstructions.push(`## Instructions from ${alias}\n\n${instructions}`)
+      }
+    } catch {}
+
+    try {
+      const local = JSON.parse(await readFile(join(repoBase, 'settings.local.json'), 'utf-8'))
+      const perms = local.permissions || {}
+      if (Array.isArray(perms.allow)) allAllow.push(...perms.allow)
+      if (Array.isArray(perms.deny)) allDeny.push(...perms.deny)
+    } catch {}
+
+    try {
+      const mcp = JSON.parse(await readFile(join(repoBase, 'mcp.json'), 'utf-8'))
+      const servers = mcp.mcpServers || {}
+      for (const [serverName, serverConfig] of Object.entries(servers)) {
+        mergedMcpServers[`${alias}/${serverName}`] = serverConfig
+      }
+    } catch {}
+  }
+
+  if (graph.edges && graph.edges.length > 0) {
+    repoMapLines.push('', '## Relationships', '')
+    for (const edge of graph.edges) {
+      const sourceNode = (graph.nodes || []).find(n => n.id === edge.sourceId)
+      const targetNode = (graph.nodes || []).find(n => n.id === edge.targetId)
+      if (sourceNode && targetNode) {
+        const label = edge.label || 'relates to'
+        repoMapLines.push(`- **${sourceNode.alias}** ${label} **${targetNode.alias}**`)
+      }
+    }
+  }
+
+  if (repoInstructions.length > 0) {
+    repoMapLines.push('', ...repoInstructions)
+  }
+
+  // NOTE: the legacy "Session Continuity" block that referenced /save-context
+  // and /resume-context is intentionally omitted. Native session resume +
+  // save-project-doc skill replace it.
+
+  const claudeDir = join(dir, '.claude')
+  await mkdir(claudeDir, { recursive: true })
+  await writeText(join(claudeDir, 'CLAUDE.md'), repoMapLines.join('\n') + '\n')
+
+  const additionalDirectories = repos.map(r => r.path)
+  await writeJson(join(claudeDir, 'settings.local.json'), {
+    permissions: {
+      allow: [...new Set(allAllow)],
+      deny: [...new Set(allDeny)],
+      additionalDirectories
+    }
+  })
+
+  if (Object.keys(mergedMcpServers).length > 0) {
+    await writeJson(join(claudeDir, 'mcp.json'), { mcpServers: mergedMcpServers })
+  }
+
+  await scrubLegacyCommands(claudeDir)
+
+  // Workspace marker so the SessionStart hook can confirm CWD is canopy-managed.
+  await writeText(join(dir, '.canopy-workspace'), name + '\n')
+
+  profile.lastLaunchedAt = new Date().toISOString()
+  await saveProfile(name, profile)
+
+  return { dir, mergedMcpServers, allAllow: [...new Set(allAllow)], allDeny: [...new Set(allDeny)], additionalDirectories }
+}
+
+async function scrubLegacyCommands(claudeDir) {
+  const commandsDir = join(claudeDir, 'commands')
+  for (const name of ['save-context.md', 'resume-context.md']) {
+    const path = join(commandsDir, name)
+    if (!existsSync(path)) continue
+    if (LEGACY_COMMAND_HASHES.size === 0) {
+      // Conservative default: only delete if the file is short and contains the
+      // canonical "save a context snapshot" / "resume work from the most recent"
+      // phrasing from the original Electron app.
+      const content = await readFile(path, 'utf-8')
+      const isLegacySaveContext = name === 'save-context.md'
+        && content.includes('Save a context snapshot of the current session')
+        && content.length < 2000
+      const isLegacyResumeContext = name === 'resume-context.md'
+        && content.includes('Resume work from the most recent context snapshot')
+        && content.length < 2000
+      if (isLegacySaveContext || isLegacyResumeContext) {
+        await unlink(path)
+      }
+      continue
+    }
+    const hash = createHash('sha256').update(await readFile(path)).digest('hex')
+    if (LEGACY_COMMAND_HASHES.has(hash)) await unlink(path)
+  }
+}
+
+// ── subcommands ───────────────────────────────────────────────────────────
+
+async function cmdList(args) {
+  const verbose = args.includes('--verbose') || args.includes('-v')
+  const profiles = await listWorkspaces()
+  if (profiles.length === 0) {
+    console.log('No workspaces. Create one with: canopy new <name>')
+    return
+  }
+  for (const p of profiles) {
+    const repoCount = (p.repos || []).length
+    const last = p.lastLaunchedAt ? ` (last launched ${p.lastLaunchedAt})` : ''
+    console.log(`${p.name} — ${repoCount} repo${repoCount === 1 ? '' : 's'}${last}`)
+    if (verbose) {
+      for (const r of p.repos || []) {
+        console.log(`  • ${aliasFor(r)} → ${r.path}`)
+      }
+    }
+  }
+}
+
+async function cmdNew(args) {
+  const name = args[0]
+  if (!name) throw new Error('Usage: canopy new <name>')
+  const dir = workspaceDir(name)
+  if (existsSync(join(dir, 'workspace.json'))) {
+    throw new Error(`Workspace already exists: ${name}`)
+  }
+  await mkdir(dir, { recursive: true })
+  const profile = {
+    name,
+    createdAt: new Date().toISOString(),
+    repos: [],
+    graph: { nodes: [], edges: [], viewportX: 0, viewportY: 0 }
+  }
+  await saveProfile(name, profile)
+  console.log(`Created workspace: ${name}`)
+  console.log(`  ${dir}`)
+}
+
+async function cmdEdit(args) {
+  const name = args[0]
+  if (!name) throw new Error('Usage: canopy edit <name>')
+  await loadProfile(name)
+  const lockPath = join(workspaceDir(name), '.canopy-edit.lock')
+  if (existsSync(lockPath)) {
+    const pid = (await readFile(lockPath, 'utf-8')).trim()
+    let alive = false
+    try {
+      process.kill(Number(pid), 0)
+      alive = true
+    } catch {}
+    if (alive) throw new Error(`Another editor is already running (pid ${pid}). If stale, delete ${lockPath}`)
+  }
+  await writeText(lockPath, String(process.pid))
+  try {
+    const uiBin = join(import.meta.dirname, 'canopy-ui')
+    const child = spawn(process.execPath, [uiBin, '--workspace', name], { stdio: 'inherit' })
+    await new Promise((res, rej) => {
+      child.on('exit', code => code === 0 ? res() : rej(new Error(`canopy-ui exited with code ${code}`)))
+      child.on('error', rej)
+    })
+  } finally {
+    try { await unlink(lockPath) } catch {}
+  }
+}
+
+async function cmdAddRepo(args) {
+  const [name, path, alias] = args
+  if (!name || !path) throw new Error('Usage: canopy add-repo <workspace> <repoPath> [alias]')
+  const profile = await loadProfile(name)
+  const absPath = resolve(path)
+  if (!existsSync(absPath)) throw new Error(`Repo path does not exist: ${absPath}`)
+  if ((profile.repos || []).some(r => r.path === absPath)) {
+    throw new Error(`Repo already in workspace: ${absPath}`)
+  }
+  profile.graph ||= { nodes: [], edges: [], viewportX: 0, viewportY: 0 }
+  const repo = {
+    path: absPath,
+    alias: alias || basename(absPath),
+    lastAccessed: new Date().toISOString()
+  }
+  const node = buildNode(repo, defaultNodePosition(profile.graph.nodes.length))
+  const newEdges = autowireEdges(profile.graph.nodes, node.id)
+  profile.repos = [...(profile.repos || []), repo]
+  profile.graph.nodes.push(node)
+  profile.graph.edges.push(...newEdges)
+  await saveProfile(name, profile)
+  const wired = newEdges.length === 0
+    ? '(first repo — no relationships yet)'
+    : `auto-wired ${newEdges.length} relationship${newEdges.length === 1 ? '' : 's'} to existing repos (edit labels in the UI)`
+  console.log(`Added ${aliasFor(repo)} → ${absPath}`)
+  console.log(`  ${wired}`)
+  console.log(`(Run "canopy launch ${name}" then start a fresh claude session in the workspace dir to pick up the new repo's settings.)`)
+}
+
+async function cmdShow(args) {
+  const name = args[0]
+  if (!name) throw new Error('Usage: canopy show <name>')
+  const profile = await loadProfile(name)
+  const dir = workspaceDir(name)
+  const repos = profile.repos || []
+  const graph = profile.graph || { nodes: [], edges: [] }
+  const lastLaunched = profile.lastLaunchedAt ? new Date(profile.lastLaunchedAt) : null
+
+  console.log(`Workspace: ${name}`)
+  console.log(`  Path: ${dir}`)
+  console.log(`  Created: ${profile.createdAt}`)
+  console.log(`  Last launched: ${lastLaunched ? lastLaunched.toISOString() : '(never)'}`)
+  console.log(`  Repos: ${repos.length}`)
+  console.log(`  Relationships: ${graph.edges?.length || 0}`)
+
+  // Drift detection: any repo's .claude/ mtime newer than lastLaunched.
+  const drifted = []
+  if (lastLaunched) {
+    for (const repo of repos) {
+      const claudeDir = join(repo.path, '.claude')
+      if (!existsSync(claudeDir)) continue
+      try {
+        const st = await stat(claudeDir)
+        if (st.mtime > lastLaunched) drifted.push({ alias: aliasFor(repo), path: repo.path, mtime: st.mtime })
+      } catch {}
+    }
+  }
+
+  if (repos.length > 0) {
+    console.log('')
+    console.log('  Repos:')
+    for (const r of repos) {
+      const isDrifted = drifted.some(d => d.path === r.path)
+      const flag = isDrifted ? ' [DRIFTED — repo .claude/ changed since last launch]' : ''
+      const exists = existsSync(r.path) ? '' : ' [MISSING — path does not exist]'
+      console.log(`    • ${aliasFor(r)} → ${r.path}${flag}${exists}`)
+    }
+  }
+
+  if (drifted.length > 0) {
+    console.log('')
+    console.log(`  ⚠ ${drifted.length} repo${drifted.length === 1 ? '' : 's'} changed since last launch — run "canopy launch ${name}" to re-merge.`)
+  }
+
+  // Docs index
+  const docsDir = join(dir, 'docs')
+  if (existsSync(docsDir)) {
+    try {
+      const docs = (await readdir(docsDir)).filter(f => f.endsWith('.md')).sort().reverse()
+      if (docs.length > 0) {
+        console.log('')
+        console.log(`  Project docs (${docs.length}):`)
+        for (const d of docs.slice(0, 5)) console.log(`    • docs/${d}`)
+        if (docs.length > 5) console.log(`    … and ${docs.length - 5} more`)
+      }
+    } catch {}
+  }
+}
+
+async function cmdRemoveRepo(args) {
+  const [name, target] = args
+  if (!name || !target) throw new Error('Usage: canopy remove-repo <workspace> <alias-or-path>')
+  const profile = await loadProfile(name)
+  profile.graph ||= { nodes: [], edges: [], viewportX: 0, viewportY: 0 }
+  const absTarget = existsSync(resolve(target)) ? resolve(target) : null
+  const repo = (profile.repos || []).find(r => r.path === absTarget || r.alias === target || r.path === target)
+  if (!repo) throw new Error(`Repo not found in workspace ${name}: ${target}\n(Match by alias or absolute path. "canopy show ${name}" lists them.)`)
+  const removedNodeIds = profile.graph.nodes.filter(n => n.repoPath === repo.path).map(n => n.id)
+  profile.repos = profile.repos.filter(r => r.path !== repo.path)
+  profile.graph.nodes = profile.graph.nodes.filter(n => n.repoPath !== repo.path)
+  profile.graph.edges = profile.graph.edges.filter(e =>
+    !removedNodeIds.includes(e.sourceId) && !removedNodeIds.includes(e.targetId)
+  )
+  await saveProfile(name, profile)
+  console.log(`Removed ${aliasFor(repo)} → ${repo.path}`)
+  console.log(`  Dropped ${removedNodeIds.length} graph node and connected edges.`)
+  console.log(`(Run "canopy launch ${name}" then start a fresh claude session to apply: removed additionalDirectories and any inherited permissions/MCP from this repo.)`)
+}
+
+async function cmdRename(args) {
+  const [oldName, newName] = args
+  if (!oldName || !newName) throw new Error('Usage: canopy rename <oldName> <newName>')
+  if (oldName === newName) throw new Error('Old and new names are identical')
+  if (!/^[A-Za-z0-9 _.-]+$/.test(newName)) throw new Error('New name may only contain letters, numbers, spaces, dots, underscores, and dashes')
+  const oldDir = workspaceDir(oldName)
+  const newDir = workspaceDir(newName)
+  if (!existsSync(join(oldDir, 'workspace.json'))) throw new Error(`Workspace not found: ${oldName}`)
+  if (existsSync(newDir)) throw new Error(`Target name already exists: ${newName}`)
+  await fsRename(oldDir, newDir)
+  const profile = await readJson(join(newDir, 'workspace.json'))
+  profile.name = newName
+  await writeJson(join(newDir, 'workspace.json'), profile)
+  // The .canopy-workspace marker (if present) holds the old name; refresh it.
+  const markerPath = join(newDir, '.canopy-workspace')
+  if (existsSync(markerPath)) await writeText(markerPath, newName + '\n')
+  console.log(`Renamed: ${oldName} → ${newName}`)
+  console.log(`  ${newDir}`)
+  console.log('(If you have a session open in the old workspace dir, exit and re-enter the new path: ' + newDir + ')')
+}
+
+async function cmdDelete(args) {
+  const [name, ...flags] = args
+  if (!name) throw new Error('Usage: canopy delete <name> --force')
+  if (!flags.includes('--force')) {
+    throw new Error(`Refusing to delete without --force.\nThis will permanently remove ${workspaceDir(name)} including any docs/ and merged config.\nRun: canopy delete ${name} --force`)
+  }
+  const dir = workspaceDir(name)
+  if (!existsSync(dir)) throw new Error(`Workspace not found: ${name}`)
+  await rm(dir, { recursive: true, force: true })
+  console.log(`Deleted workspace: ${name}`)
+  console.log(`  Removed: ${dir}`)
+}
+
+// Map user-friendly aliases to Claude Code's canonical permission-mode values.
+// Source of truth for the canonical names: the legacy canopy UI's GeneralSection.tsx.
+const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions']
+const MODE_ALIASES = {
+  'default': 'default',
+  'auto': 'bypassPermissions',
+  'full-auto': 'bypassPermissions',
+  'fullauto': 'bypassPermissions',
+  'bypass': 'bypassPermissions',
+  'unsafe': 'bypassPermissions',
+  'accept': 'acceptEdits',
+  'accept-edits': 'acceptEdits',
+  'edits': 'acceptEdits',
+  'plan': 'plan',
+  'readonly': 'plan',
+  'read-only': 'plan',
+  'dontask': 'dontAsk',
+  'dont-ask': 'dontAsk',
+  'deny': 'dontAsk'
+}
+
+function normalizeMode(input) {
+  if (!input) return null
+  const lower = input.toLowerCase()
+  if (PERMISSION_MODES.includes(input)) return input
+  if (MODE_ALIASES[lower]) return MODE_ALIASES[lower]
+  throw new Error(`Unknown permission mode: ${input}\nTry one of: ${Object.keys(MODE_ALIASES).join(', ')}`)
+}
+
+function shellSingleQuote(s) {
+  // Wrap in single quotes; close-reopen around any single quotes inside.
+  return "'" + String(s).replace(/'/g, `'\\''`) + "'"
+}
+
+function buildClaudeCmd(mode) {
+  return mode ? `claude --permission-mode ${mode}` : 'claude'
+}
+
+async function openInTerminal(cwd, mode) {
+  const claudeCmd = buildClaudeCmd(mode)
+  const cwdQuoted = shellSingleQuote(cwd)
+  const fullCmd = `cd ${cwdQuoted} && exec ${claudeCmd}`
+  // Escape for AppleScript string literal: backslash + double quote.
+  const aplStr = fullCmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  const term = process.env.TERM_PROGRAM || ''
+  let script
+  if (term === 'iTerm.app') {
+    script = [
+      'tell application "iTerm"',
+      '  activate',
+      '  tell current window',
+      '    create tab with default profile',
+      '    tell current session of current tab',
+      `      write text "${aplStr}"`,
+      '    end tell',
+      '  end tell',
+      'end tell'
+    ].join('\n')
+  } else {
+    script = [
+      'tell application "Terminal"',
+      `  do script "${aplStr}"`,
+      '  activate',
+      'end tell'
+    ].join('\n')
+  }
+  const child = spawn('osascript', ['-e', script], { stdio: 'inherit' })
+  await new Promise((res, rej) => {
+    child.on('exit', code => code === 0 ? res() : rej(new Error(`osascript exited with code ${code}`)))
+    child.on('error', rej)
+  })
+}
+
+async function cmdLaunch(args) {
+  const positional = []
+  let mode = null
+  let openTerminal = false
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a === '--mode' || a === '-m') { mode = normalizeMode(args[++i]); continue }
+    if (a.startsWith('--mode=')) { mode = normalizeMode(a.slice(7)); continue }
+    if (a === '--terminal' || a === '-t') { openTerminal = true; continue }
+    if (a === '--no-terminal') { openTerminal = false; continue }
+    positional.push(a)
+  }
+  const name = positional[0]
+  if (!name) throw new Error('Usage: canopy launch <name> [--mode <mode>] [--terminal]')
+  const result = await mergeWorkspaceConfig(name)
+  console.log(`Workspace ready at:\n  ${result.dir}\n`)
+  console.log(`Merged: ${result.allAllow.length} allow rule(s), ${result.allDeny.length} deny rule(s), ${Object.keys(result.mergedMcpServers).length} MCP server(s), ${result.additionalDirectories.length} additionalDirectories.`)
+  if (mode) console.log(`Permission mode: ${mode}`)
+  console.log('')
+  if (openTerminal) {
+    try {
+      await openInTerminal(result.dir, mode)
+      console.log(`Opened a new ${process.env.TERM_PROGRAM === 'iTerm.app' ? 'iTerm' : 'Terminal'} tab and started claude there.`)
+    } catch (err) {
+      console.log(`Failed to open terminal: ${err.message}`)
+      console.log(`Run manually:\n  cd ${shellSingleQuote(result.dir)} && ${buildClaudeCmd(mode)}`)
+    }
+  } else {
+    console.log('Exit this session and start a fresh one in the workspace dir:\n')
+    console.log(`  cd ${shellSingleQuote(result.dir)} && ${buildClaudeCmd(mode)}\n`)
+    console.log('The new session will pick up merged permissions, MCP servers, additionalDirectories, and CLAUDE.md.')
+    console.log('(Pass --terminal next time to have canopy open the new session for you.)')
+  }
+}
+
+async function cmdSessionContext() {
+  // SessionStart hook entrypoint. Short-circuit silently outside workspace dirs.
+  const cwd = process.cwd()
+  if (!cwd.startsWith(WORKSPACES_ROOT + '/') && cwd !== WORKSPACES_ROOT) {
+    process.exit(0)
+  }
+  const markerPath = join(cwd, '.canopy-workspace')
+  if (!existsSync(markerPath)) process.exit(0)
+  const name = (await readFile(markerPath, 'utf-8')).trim()
+  let profile
+  try { profile = await loadProfile(name) } catch { process.exit(0) }
+
+  const lines = [`# Canopy workspace: ${name}`, '']
+  lines.push('## Repos accessible via additionalDirectories')
+  for (const r of profile.repos || []) {
+    lines.push(`- **${aliasFor(r)}** → \`${r.path}\``)
+  }
+  const edges = (profile.graph?.edges || [])
+  if (edges.length > 0) {
+    lines.push('', '## Relationships')
+    for (const edge of edges) {
+      const s = (profile.graph.nodes || []).find(n => n.id === edge.sourceId)
+      const t = (profile.graph.nodes || []).find(n => n.id === edge.targetId)
+      if (s && t) lines.push(`- **${s.alias}** ${edge.label || 'relates to'} **${t.alias}**`)
+    }
+  }
+  const docsDir = join(cwd, 'docs')
+  if (existsSync(docsDir)) {
+    try {
+      const docs = (await readdir(docsDir)).filter(f => f.endsWith('.md')).sort().reverse()
+      if (docs.length > 0) {
+        lines.push('', `## Project docs (${docs.length})`)
+        for (const d of docs.slice(0, 5)) lines.push(`- \`docs/${d}\``)
+        if (docs.length > 5) lines.push(`- … and ${docs.length - 5} more`)
+      }
+    } catch {}
+  }
+
+  const out = {
+    hookSpecificOutput: {
+      hookEventName: 'SessionStart',
+      additionalContext: lines.join('\n')
+    }
+  }
+  process.stdout.write(JSON.stringify(out))
+}
+
+async function cmdHelp() {
+  console.log(`canopy — multi-repo workspace orchestration
+
+Subcommands:
+  list [-v]                          List workspaces (verbose shows repos)
+  show <ws>                          Print workspace summary + drift hint
+  new <name>                         Create an empty workspace
+  edit <ws>                          Open the configuration UI in your browser
+  add-repo <ws> <path> [alias]       Add a repo (auto-wires to existing)
+  remove-repo <ws> <alias-or-path>   Remove a repo and its graph node + edges
+  rename <oldName> <newName>         Rename a workspace
+  delete <ws> --force                Permanently delete a workspace
+  launch <ws> [--mode M] [-t]        Merge configs; -t opens a new Terminal tab
+                                       --mode aliases: auto, accept, plan, default, dont-ask
+  session-context                    (internal) SessionStart hook entrypoint
+`)
+}
+
+// ── entry ────────────────────────────────────────────────────────────────
+
+const [, , sub, ...rest] = process.argv
+const handlers = {
+  list: cmdList,
+  show: cmdShow,
+  new: cmdNew,
+  edit: cmdEdit,
+  'add-repo': cmdAddRepo,
+  'remove-repo': cmdRemoveRepo,
+  rename: cmdRename,
+  delete: cmdDelete,
+  launch: cmdLaunch,
+  'session-context': cmdSessionContext,
+  help: cmdHelp,
+  '--help': cmdHelp,
+  '-h': cmdHelp
+}
+
+const fn = handlers[sub] || cmdHelp
+try {
+  await fn(rest)
+} catch (err) {
+  console.error(`error: ${err.message}`)
+  process.exit(1)
+}
