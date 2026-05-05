@@ -1,0 +1,12 @@
+{
+  "name": "ux-harness",
+  "version": "0.1.0",
+  "description": "UI/UX interaction harness plugin",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
