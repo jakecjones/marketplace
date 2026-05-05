@@ -1,0 +1,12 @@
+{
+  "name": "@claude-marketplace/core",
+  "version": "0.1.0",
+  "description": "Core registry and loader for the Claude marketplace",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

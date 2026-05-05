@@ -1,0 +1,17 @@
+{
+  "name": "claude-marketplace",
+  "version": "0.1.0",
+  "description": "Claude marketplace for managing skills, agents, hooks, and MCPs",
+  "private": true,
+  "workspaces": [
+    "core",
+    "plugins/*"
+  ],
+  "scripts": {
+    "list": "node core/bin/list.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

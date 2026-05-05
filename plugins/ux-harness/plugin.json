@@ -1,0 +1,5 @@
+{
+  "name": "ux-harness",
+  "version": "0.1.0",
+  "description": "UI/UX interaction harness — renders UI components, captures user input, and streams Claude responses to the surface layer"
+}

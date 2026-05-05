@@ -1,0 +1,24 @@
+{
+  "marketplace": "claude",
+  "version": "0.1.0",
+  "plugins": [
+    {
+      "name": "ux-harness",
+      "path": "plugins/ux-harness",
+      "enabled": true,
+      "description": "UI/UX interaction harness — renders components, captures input, streams responses"
+    },
+    {
+      "name": "canopy",
+      "path": "plugins/canopy",
+      "enabled": true,
+      "description": "Umbrella context layer — conversation memory, hierarchical retrieval, multi-agent orchestration"
+    }
+  ],
+  "hooks": {
+    "beforeSkill": [],
+    "afterSkill": [],
+    "onSessionStart": [],
+    "onSessionEnd": []
+  }
+}
