@@ -4,6 +4,6 @@
   "description": "Multi-repo workspace orchestration: merge .claude/ configs from declared repos and host project-specific docs.",
   "author": { "name": "Jake Jones" },
   "homepage": "https://github.com/jakecjones/marketplace/tree/main/plugins/canopy",
-  "repository": { "type": "git", "url": "https://github.com/jakecjones/marketplace" },
+  "repository": "https://github.com/jakecjones/marketplace",
   "license": "MIT"
 }
